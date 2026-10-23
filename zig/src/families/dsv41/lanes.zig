@@ -433,7 +433,7 @@ pub const Lanes = struct {
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
-        if (size > m.pool_cap) return error.PromptTooLong;
+        if (size > m.ctx_cap) return error.PromptTooLong;
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;
@@ -892,7 +892,7 @@ pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
-    const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
+    const buf = try gpa.alloc(u8, (m.ctx_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
     defer for (&seqs) |*q| q.deinit(gpa);

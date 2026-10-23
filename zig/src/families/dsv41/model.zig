@@ -27,6 +27,7 @@ const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
+const display_kv = @import("display_kv.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -62,6 +63,7 @@ pub const Options = struct {
     streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
+    display_kv_mib: ?usize = null, // MiB of the display reservation credited to the pool (TF_DS_DISPLAY_KV_MIB)
 };
 
 pub const Model = struct {
@@ -76,6 +78,8 @@ pub const Model = struct {
     streams: usize, // the pool's streams (Options.streams)
     round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
     pool_cap: usize,
+    ctx_cap: usize = 0,
+    display_span: ?display_kv.Span = null,
     cache_dir: std.Io.Dir,
     cache_file: std.Io.File,
     ix: rank_cache.Index,
@@ -162,7 +166,11 @@ pub const Model = struct {
         m.streams = o.streams;
         m.round_ms = o.round_ms orelse &draft.round_ms;
         if (m.round_ms.len == 0) return error.BadRoundMs;
+        const display_mib = if (o.display_kv_mib) |v| try display_kv.checkMib(v) else try display_kv.envMib();
+        const display_bytes = display_mib << 20;
+        m.ctx_cap = o.pool;
         m.pool_cap = o.pool;
+        m.display_span = null;
         m.fill_slot = 0;
         m.prof = false;
         m.timer = null;
@@ -186,6 +194,8 @@ pub const Model = struct {
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
+        const display_pos = try display_kv.positionsAdded(c, display_bytes);
+        m.pool_cap = o.pool + display_pos;
         m.stream = try cuda.Stream.init(d, true);
         errdefer m.stream.deinit();
 
@@ -276,7 +286,14 @@ pub const Model = struct {
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
-        m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
+        errdefer if (m.display_span) |*s| s.deinit();
+        if (display_bytes > 0) {
+            var sizes: [display_kv.max_planes]usize = undefined;
+            const pl = try display_kv.planPlanes(sizes[0..display_kv.poolPlaneSizes(c, m.pool_cap, &sizes)], display_bytes);
+            m.display_span = try display_kv.Span.map(d, io, pl.ordinary, pl.display, pl.planes);
+            std.log.info("dsv41: {d} MiB ({d} B) of the pool in the display reservation ({s}): +{d} positions ({d} total), {d} planes in its span", .{ display_mib, display_bytes, display_kv.env_name, display_pos, m.pool_cap, pl.planes });
+        }
+        m.caches = if (m.display_span) |*s| try display_kv.initCaches(&m.eng, &m.arena, m.pool_cap, m.streams, s) else try prompt.Caches.init(&m.eng, &m.arena, m.pool_cap, m.streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
         m.eng.blas = &m.blas;
@@ -362,6 +379,7 @@ pub const Model = struct {
         if (m.tables) |*t| t.close();
         if (m.rdma_rings) |*r| r.close(m.gpa);
         m.blas.close();
+        if (m.display_span) |*s| s.deinit();
         m.arena.deinit();
         m.rope_buf.free();
         m.ex.unload();
@@ -487,6 +505,7 @@ pub const Model = struct {
     }
 
     fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
+        if (m.display_span) |s| if (s.contains(plane)) return display_kv.copySpan(&m.ops, m.stream, plane, from, to, n, row);
         const d = m.ctx.d;
         try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + to * row, plane + from * row, n * row, m.stream.handle), "cuMemcpyDtoDAsync");
     }
@@ -670,7 +689,7 @@ pub const Model = struct {
         const e = &m.eng;
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
         const t0 = m.now();
-        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null, if (m.graphs) |*g| g else null);
+        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.ctx_cap, null, if (m.graphs) |*g| g else null);
         if (m.prof) {
             m.t_enqueue = m.now() - t0;
             try m.stream.synchronize();

@@ -33,6 +33,7 @@ const round = @import("round.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
+const display_kv = @import("display_kv.zig");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -139,6 +140,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
         .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
         .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
+        .display_kv_mib = if (getenv("TF_DS_DISPLAY_KV_MIB")) |v| try display_kv.parseMib(v) else 0,
     });
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
@@ -176,6 +178,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+        error.BadDisplayKv => "TF_DS_DISPLAY_KV_MIB: a multiple of 16 from 0 to 2032",
+        error.DisplayConnected => "TF_DS_DISPLAY_KV_MIB: a display is connected to /dev/dri/card0; unset it when a monitor is attached",
+        error.DisplayCardUnavailable, error.DisplayIoctlFailed, error.ShortDisplayBuffer, error.DisplayMmapFailed, error.DisplayRegisterFailed, error.DisjointDisplaySpan, error.DisplayKvTooLarge => "TF_DS_DISPLAY_KV_MIB: the display reservation on /dev/dri/card0 could not be mapped and registered",
         else => null,
     };
 }
